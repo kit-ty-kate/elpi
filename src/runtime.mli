@@ -11,12 +11,21 @@ module Pp : sig
   val uppterm :
     ?pp_ctx:(string Util.PtrMap.t * int) ref -> ?min_prec:int -> int -> string list -> int -> env ->
        Format.formatter -> term -> unit
+
+  val pp_oref : Format.formatter -> (Util.UUID.t * Obj.t) -> unit
 end
 val pp_stuck_goal : ?pp_ctx:(string Util.PtrMap.t * int) ref -> Fmt.formatter -> stuck_goal -> unit
 
+val embed_query :
+  mk_Arg:(State.t -> name:string -> args:term list -> State.t * term) ->
+  depth:int ->
+  State.t -> 'a Query.t -> State.t * term
+
 (* Interpreter API *)
-val execute_once : ?max_steps:int -> ?delay_outside_fragment:bool -> 'a executable -> 'a outcome
-val execute_loop : ?delay_outside_fragment:bool -> 'a executable -> more:(unit -> bool) -> pp:(float -> 'a outcome -> unit) -> unit
+val execute_once :
+  ?max_steps:int -> ?delay_outside_fragment:bool -> 'a executable -> 'a outcome
+val execute_loop :
+  ?delay_outside_fragment:bool -> 'a executable -> more:(unit -> bool) -> pp:(float -> 'a outcome -> unit) -> unit
 
 (* Functions useful to implement built-in predicates and evaluable functions *)
 val deref_uv : ?avoid:uvar_body -> from:constant -> to_:constant -> int -> term -> term
