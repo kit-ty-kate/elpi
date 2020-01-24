@@ -30,13 +30,12 @@ let static_data = ref None
 let initialize_static_data () =
   if not !Data.elpi_initialized then begin
     Data.elpi_initialized := true;
-    static_data := Some (Data.Symbols.copy !Data.Symbols.current_table)
+    static_data := Some (Data.State.init ())
   end;
   begin match !static_data with
   | None -> assert false
-  | Some symtab -> Data.Symbols.current_table:= Data.Symbols.copy symtab
-  end;
-  Data.State.init ()
+  | Some s -> s
+  end
 
 let init ~builtins:(fname,decls) ~basedir:cwd argv =
   let new_argv = set_trace argv in
@@ -84,7 +83,6 @@ let init ~builtins:(fname,decls) ~basedir:cwd argv =
           Util.Loc.(loc.source_stop - loc.line_starts_at));
       Util.anomaly ~loc msg in
   let state = Data.State.set Data.while_compiling state false in
-  let state = Data.State.set Data.Symbols.table state (Data.Symbols.copy !Data.Symbols.current_table) in
   { header; state }, new_argv
 
 let trace args =
@@ -497,7 +495,7 @@ module RawData = struct
     | x -> Obj.magic x
   [@@ inline]
 
-  let mkConst = ED.mkConst
+  let mkConst = ED.Constants.mkConst
   let mkLam = ED.Term.mkLam
   let mkApp = ED.Term.mkApp
   let mkCons = ED.Term.mkCons
@@ -505,11 +503,11 @@ module RawData = struct
   let mkDiscard = ED.Term.mkDiscard
   let mkBuiltin = ED.Term.mkBuiltin
   let mkCData = ED.Term.mkCData
-  let mkAppL = ED.mkAppL
-  let mkAppS = ED.mkAppS
-  let mkAppSL = ED.mkAppSL
+  let mkAppL = ED.Constants.mkAppL
+  let mkAppS = ED.Constants.mkAppS
+  let mkAppSL = ED.Constants.mkAppSL
 
-  let mkGlobalS s = mkConst (ED.Symbols.get_global_symbol_str s)
+  let mkGlobalS s = ED.Constants.mkAppSL s []
 
   let mkGlobal i =
     if i >= 0 then Util.anomaly "mkGlobal: got a bound variable";
@@ -791,7 +789,7 @@ module Quotation = struct
 
   let term_at ~depth s x = Compiler.term_of_ast ~depth s x
 
-  let quote_syntax (q,_) = Compiler.quote_syntax q
+  let quote_syntax s (q,_) = Compiler.quote_syntax s q
 
 end
 

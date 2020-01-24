@@ -294,12 +294,20 @@ let while_compiling = State.declare ~name:"elpi:compiling"
 
 module Symbols : sig
 
+  (* Table used at runtime *)
   type t
-  val copy : t -> t
-  val current_table : t ref
-  val table : t State.component
+  val current_table : t Fork.local_ref
 
-  val show : constant -> string
+  (* Table used at compilation time *)
+  type t_comp
+  val table : t_comp State.component
+
+  (* Read the table after OCaml module initialization *)
+  val static_table : unit -> t_comp
+
+  (* Compile the symbol table *)
+  val compile : t_comp -> t
+
 
   (* Static initialization, eg link time *)
   val declare_global_symbol : string -> constant
@@ -332,16 +340,20 @@ module Symbols : sig
   val print_constraintsc  : constant
 
   (* Compilation phase *)
-  val allocate_global_symbol     : State.t -> F.t -> constant * term
-  val allocate_global_symbol_str : State.t -> string -> constant
-  val allocate_Arg_symbol        : State.t -> int -> constant
-  val allocate_bound_symbol      : State.t -> int -> term
-
-  (* Compilation or runtime *)
-  val get_global_symbol : F.t -> constant
-  val get_global_symbol_str : string -> constant
+  val allocate_global_symbol     : State.t -> F.t -> State.t * (constant * term)
+  val allocate_global_symbol_str : State.t -> string -> State.t * constant
+  val allocate_Arg_symbol        : State.t -> int -> State.t * constant
+  val allocate_bound_symbol      : State.t -> int -> State.t * term
+  val get_global_or_allocate_bound_symbol        : State.t -> int -> State.t * term
+  val get_canonical              : State.t -> int -> term
+  val get_global_symbol          : State.t -> F.t -> constant * term
+  val get_global_symbol_str      : State.t -> string -> constant * term
+  val show                       : State.t -> constant -> string
 
   (* Private (Runtime) *)
+  val __show : constant -> string
+  val __get_global : F.t -> constant
+  val __get_global_str : string -> constant
   val __mkConst : int -> term
   val __fresh_global_constant : unit -> constant * term
 
@@ -358,31 +370,47 @@ type t = {
 }
 [@@deriving show]
 
-let copy { ast2ct; c2s; c2t; last_global } = {
-    ast2ct = Hashtbl.copy ast2ct;
-    c2s = Hashtbl.copy c2s;
-    c2t = Hashtbl.copy c2t;
-    last_global = last_global;
-  }
-
-let current_table = Fork.new_local {
+let empty_table () = {
   last_global = 0;
   ast2ct = Hashtbl.create 37;
   c2s = Hashtbl.create 37;
   c2t = Hashtbl.create 17;
 }
 
-let show n =
-  try Hashtbl.find !current_table.c2s n
-  with Not_found -> "SYMBOL" ^ string_of_int n
+let current_table = Fork.new_local (empty_table ())
+
+type t_comp = {
+  cc_ast2ct : (constant * term) F.Map.t;
+  cc_c2s : string IntMap.t;
+  cc_c2t : term IntMap.t;
+  cc_last_global : int;
+}
+[@@deriving show]
+
+let static_table () =
+  let { ast2ct; c2s; c2t; last_global } = !current_table in
+  {
+    cc_ast2ct = Hashtbl.fold F.Map.add ast2ct F.Map.empty;
+    cc_c2s = Hashtbl.fold IntMap.add c2s IntMap.empty;
+    cc_c2t = Hashtbl.fold IntMap.add c2t IntMap.empty;
+    cc_last_global = last_global;
+  }
+
+let compile { cc_ast2ct; cc_c2s; cc_c2t; cc_last_global } =
+  let t = empty_table () in
+  IntMap.iter (Hashtbl.add t.c2s) cc_c2s;
+  IntMap.iter (Hashtbl.add t.c2t) cc_c2t;
+  F.Map.iter (Hashtbl.add t.ast2ct) cc_ast2ct;
+  t.last_global <- cc_last_global;
+  t
+
 
 let table = State.declare ~name:"elpi:compiler:table"
-  ~pp
+  ~pp:pp_t_comp
   ~clause_compilation_is_over:(fun x -> x)
   ~goal_compilation_is_over:(fun ~args:_ x -> Some x)
   ~compilation_is_over:(fun _ -> None)
-  ~init:(fun () -> !current_table)
-
+  ~init:static_table
 
 let declare_global_symbol x =
   if !elpi_initialized then anomaly ("global symbols cannot be declared after initialization");
@@ -424,32 +452,76 @@ let print_constraintsc  = declare_global_symbol "print_constraints"
 
 let allocate_global_symbol state x =
   if not (State.get while_compiling state) then anomaly ("global symbols can only be allocated during compilation");
-  try Hashtbl.find !current_table.ast2ct x
-  with Not_found ->
-    !current_table.last_global <- !current_table.last_global - 1;
-    let n = !current_table.last_global in
-    let xx = Term.Const n in
-    let p = n,xx in
-    Hashtbl.add !current_table.c2s n (F.show x);
-    Hashtbl.add !current_table.c2t n xx;
-    Hashtbl.add !current_table.ast2ct x p;
-    p
+  State.update_return table state
+    (fun ({ cc_c2s; cc_c2t; cc_ast2ct; cc_last_global } as table) ->
+      try table, F.Map.find x cc_ast2ct
+      with Not_found ->
+        let cc_last_global = cc_last_global - 1 in
+        let n = cc_last_global in
+        let xx = Term.Const n in
+        let p = n,xx in
+        let cc_c2s = IntMap.add n (F.show x) cc_c2s in
+        let cc_c2t = IntMap.add n xx cc_c2t in
+        let cc_ast2ct = F.Map.add x p cc_ast2ct in
+        { cc_c2s; cc_c2t; cc_ast2ct; cc_last_global }, p)
 
 let allocate_global_symbol_str st x =
   let x = F.from_string x in
-  fst (allocate_global_symbol st x)
+  let st, (c,_) = allocate_global_symbol st x in
+  st, c
 
 let allocate_Arg_symbol st n =
   let x = Printf.sprintf "%%Arg%d" n in
   allocate_global_symbol_str st x
 
-let get_global_symbol x =
+let show state n =
+  try IntMap.find n (State.get table state).cc_c2s
+  with Not_found -> "SYMBOL" ^ string_of_int n
+
+let allocate_bound_symbol state n =
+  if not (State.get while_compiling state) then
+    anomaly "bound symbols can only be allocated during compilation";
+  if n < 0 then
+    anomaly "bound variables are positive";
+  State.update_return table state
+    (fun ({ cc_c2s; cc_c2t; cc_ast2ct; cc_last_global } as table) ->
+      try table, IntMap.find n cc_c2t
+      with Not_found ->
+        let xx = Const n in
+        let cc_c2s = IntMap.add n ("c" ^ string_of_int n) cc_c2s in
+        let cc_c2t = IntMap.add n xx cc_c2t in
+        { cc_c2s; cc_c2t; cc_ast2ct; cc_last_global }, xx)
+;;
+
+let get_canonical state c =
+  if not (State.get while_compiling state) then
+    anomaly "get_canonical can only be used during compilation";
+  try IntMap.find c (State.get table state).cc_c2t
+  with Not_found -> anomaly ("unknown symbol " ^ string_of_int c)
+
+let get_global_or_allocate_bound_symbol state n =
+  if n >= 0 then allocate_bound_symbol state n
+  else state, get_canonical state n
+
+let get_global_symbol state s =
+  if not (State.get while_compiling state) then
+    anomaly "get_global_symbol can only be used during compilation";
+  try F.Map.find s (State.get table state).cc_ast2ct
+  with Not_found -> anomaly ("unknown symbol " ^ F.show s)
+
+let get_global_symbol_str state s = get_global_symbol state (F.from_string s)
+
+let __show n =
+  try Hashtbl.find !current_table.c2s n
+  with Not_found -> "SYMBOL" ^ string_of_int n
+
+let __get_global x =
   try fst (Hashtbl.find !current_table.ast2ct x)
   with Not_found -> anomaly ("global symbol "^F.show x^" never declared")
 
-let get_global_symbol_str x =
+let __get_global_str x =
   let x = F.from_string x in
-  get_global_symbol x
+  __get_global x
 
 let __mkConst x =
   try Hashtbl.find !current_table.c2t x
@@ -459,13 +531,6 @@ let __mkConst x =
     Hashtbl.add !current_table.c2t x xx;
     xx
   [@@inline]
-
-let allocate_bound_symbol state n =
-  if not (State.get while_compiling state) then
-    anomaly "bound symbols can only be allocated during compilation";
-  if n < 0 then
-    anomaly "bound variables are positive";
-  __mkConst n
 
 let __fresh_global_constant () =
    !current_table.last_global <- !current_table.last_global - 1;
@@ -489,6 +554,10 @@ module Constants : sig
   val pp : Fmt.formatter -> t -> unit
 
   val mkConst : constant -> term
+  val mkAppL : constant -> term list -> term
+  val mkAppS : string -> term -> term list -> term
+  val mkAppSL : string -> term list -> term
+
   val fresh_global_constant : unit -> constant * term
 
   (* mkinterval d n 0 = [d; ...; d+n-1] *)
@@ -500,11 +569,12 @@ module Self = struct
   type t = constant
   let compare x y = x - y
   let pp fmt c = pp_spaghetti pp_const fmt c
-  let show n = Symbols.show n
+  let show n = Symbols.__show n
 end
 include Self
 
-let () = Util.set_spaghetti_printer pp_const (fun fmt i -> Format.fprintf fmt "%s" (show i))
+let () = Util.set_spaghetti_printer pp_const (fun fmt i ->
+  Format.fprintf fmt "%s" (show i))
 
 module Map = Map.Make(Self)
 module Set = Set.Make(Self)
@@ -513,10 +583,8 @@ module Set = Set.Make(Self)
    - constants are hashconsed (terms)
    - we use special constants to represent !, pi, sigma *)
 
-let mkConst = Symbols.__mkConst
-
 let fresh_global_constant = Symbols.__fresh_global_constant
-
+let mkConst x = Symbols.__mkConst x [@@inline]
 
 (* mkinterval d n 0 = [d; ...; d+n-1] *)
 let rec mkinterval depth argsno n =
@@ -524,16 +592,15 @@ let rec mkinterval depth argsno n =
  else mkConst (n+depth)::mkinterval depth argsno (n+1)
 ;;
 
-end (* }}} *)
-
-let dummy = App (Symbols.cutc,Constants.mkConst Symbols.cutc,[])
-
-let mkConst x = Constants.mkConst x [@@inline]
 let mkAppL c = function
   | [] -> mkConst c
   | x::xs -> mkApp c x xs [@@inline]
-let mkAppS s x args = mkApp (Symbols.get_global_symbol_str s) x args [@@inline]
-let mkAppSL s args = mkAppL (Symbols.get_global_symbol_str s) args [@@inline]
+let mkAppS s x args = mkApp (Symbols.__get_global_str s) x args [@@inline]
+let mkAppSL s args = mkAppL (Symbols.__get_global_str s) args [@@inline]
+
+end (* }}} *)
+
+let dummy = App (Symbols.cutc,Constants.mkConst Symbols.cutc,[])
 
 module CHR : sig
 
@@ -880,7 +947,7 @@ type ('t,'h,'c) compiled_constructor =
 type ('t,'h,'c) compiled_adt = (('t,'h,'c) compiled_constructor) Constants.Map.t
 
 let buildk kname = function
-| [] -> mkConst kname
+| [] -> Constants.mkConst kname
 | x :: xs -> mkApp kname x xs
 
 let rec readback_args : type a m t h c.
@@ -1015,25 +1082,26 @@ let compile_matcher : type bs b m ms t h c. (bs,b,ms,m,t,h,c) constructor_argume
                    ~ko:(compile_matcher_ko ko gls state) t, !gls
     | MS f -> f
 
-let compile_constructors ty self l =
-  let names =
-    List.fold_right (fun (K(name,_,_,_,_)) -> StrSet.add name) l StrSet.empty in
-  if StrSet.cardinal names <> List.length l then
-    anomaly ("Duplicate constructors name in ADT: " ^ Conversion.show_ty_ast ty);
-  List.fold_left (fun acc (K(name,_,a,b,m)) ->
-    let c = Symbols.declare_global_symbol name in
-    Constants.(Map.add c (XK(compile_arguments a self,compile_builder a b,compile_matcher a m)) acc))
-      Constants.Map.empty l
-
 let rec tyargs_of_args : type a b c d e. string -> (a,b,c,d,e) compiled_constructor_arguments -> (bool * string * string) list =
   fun self -> function
   | XN -> [false,self,""]
   | XA ({ ty },rest) -> (false,Conversion.show_ty_ast ty,"") :: tyargs_of_args self rest
 
-let document_constructor fmt self name doc args =
-  let args = tyargs_of_args self args in
+let compile_constructors ty self self_name l =
+  let names =
+    List.fold_right (fun (K(name,_,_,_,_)) -> StrSet.add name) l StrSet.empty in
+  if StrSet.cardinal names <> List.length l then
+    anomaly ("Duplicate constructors name in ADT: " ^ Conversion.show_ty_ast ty);
+  List.fold_left (fun (acc,sacc) (K(name,_,a,b,m)) ->
+    let c = Symbols.declare_global_symbol name in
+    let args = compile_arguments a self in
+    Constants.(Map.add c (XK(args,compile_builder a b,compile_matcher a m)) acc),
+    StrMap.add name (tyargs_of_args self_name args) sacc)
+      (Constants.Map.empty,StrMap.empty) l
+
+let document_constructor fmt name doc argsdoc =
   Fmt.fprintf fmt "@[<hov2>type %s@[<hov>%a.%s@]@]@\n"
-    name pp_ty_args args (if doc = "" then "" else " % " ^ doc)
+    name pp_ty_args argsdoc (if doc = "" then "" else " % " ^ doc)
 
 let document_kind fmt = function
   | Conversion.TyApp(s,_,l) ->
@@ -1049,25 +1117,25 @@ let document_adt doc ty ks cks fmt () =
   document_kind fmt ty;
   List.iter (fun (K(name,doc,_,_,_)) ->
     if name <> "uvar" then
-      let XK(args,_,_) = Constants.Map.find (Symbols.get_global_symbol_str name) cks in
-      document_constructor fmt (Conversion.show_ty_ast ty) name doc args) ks
+      let argsdoc = StrMap.find name cks in
+      document_constructor fmt name doc argsdoc) ks
 
 let adt ~look ~alloc ~mkUnifVar { ty; constructors; doc; pp } =
   let readback_ref = ref (fun ~depth _ _ _ _ -> assert false) in
   let embed_ref = ref (fun ~depth _ _ _ _ -> assert false) in
-  let cconstructors_ref = ref Constants.Map.empty in
+  let sconstructors_ref = ref StrMap.empty in
   let self = {
     ContextualConversion.ty;
     pp;
     pp_doc = (fun fmt () ->
-      document_adt doc ty constructors !cconstructors_ref fmt ());
+      document_adt doc ty constructors !sconstructors_ref fmt ());
     readback = (fun ~depth hyps constraints state term ->
       !readback_ref ~depth hyps constraints state term);
     embed = (fun ~depth hyps constraints state term ->
       !embed_ref ~depth hyps constraints state term);
   } in
-  let cconstructors = compile_constructors ty self constructors in
-  cconstructors_ref := cconstructors;
+  let cconstructors, sconstructors = compile_constructors ty self (Conversion.show_ty_ast ty) constructors in
+  sconstructors_ref := sconstructors;
   readback_ref := readback ~look ~alloc ~mkUnifVar ty cconstructors;
   embed_ref := embed ty pp cconstructors;
   self
@@ -1168,33 +1236,43 @@ let document fmt l =
 ;;
 
 
-let builtins : (Constants.Set.t * t list) State.component = State.declare ~name:"elpi:compiler:builtins"
-  ~pp:(fun fmt (s,_) -> Constants.Set.pp fmt s)
-  ~init:(fun () -> Constants.Set.empty, [])
+let builtins : (StrSet.t * Constants.Set.t * t list) State.component = State.declare ~name:"elpi:compiler:builtins"
+  ~pp:(fun fmt (s,_,_) -> StrSet.pp fmt s)
+  ~init:(fun () -> StrSet.empty, Constants.Set.empty, [])
   ~clause_compilation_is_over:(fun x -> x)
   ~goal_compilation_is_over:(fun ~args x -> Some x)
   ~compilation_is_over:(fun _ -> None)
 ;;
 
-let all state = fst (State.get builtins state)
+let all state =
+  let _, csts, _ = State.get builtins state in
+  csts
 
 let register state (Pred(s,_,_) as b) =
   if s = "" then anomaly "Built-in predicate name must be non empty";
   if not (State.get while_compiling state) then
     anomaly "Built-in can only be declared at compile time";
-  let idx = Symbols.allocate_global_symbol_str state s in
-  let declared, _ = State.get builtins state in
+  let state, idx = Symbols.allocate_global_symbol_str state s in
+  let _, declared, _ = State.get builtins state in
   if Constants.Set.mem idx declared then
     anomaly ("Duplicate built-in predicate " ^ s);
-  State.update builtins state (fun (s,l) -> Constants.Set.add idx s, b :: l)
+  State.update builtins state (fun (w,i,l) -> StrSet.add s w, Constants.Set.add idx i, b :: l)
+;;
+
+let is_declared_str state x =
+  let declared, _, _ = State.get builtins state in
+  StrSet.mem x declared
+  || x == Symbols.(show state declare_constraintc)
+  || x == Symbols.(show state print_constraintsc)
+  || x == Symbols.(show state cutc)
 ;;
 
 let is_declared state x =
-  let declared, _ = State.get builtins state in
+  let _, declared, _ = State.get builtins state in
   Constants.Set.mem x declared
-  || x == Symbols.declare_constraintc
-  || x == Symbols.print_constraintsc
-  || x == Symbols.cutc
+  || x == Symbols.(declare_constraintc)
+  || x == Symbols.(print_constraintsc)
+  || x == Symbols.(cutc)
 ;;
 
 type builtin_table = (int, t) Hashtbl.t

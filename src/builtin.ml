@@ -810,8 +810,9 @@ let elpi_builtins = let open BuiltIn in let open BuiltInData in let open Context
       let p =
         API.Compile.(program ~flags:default_flags dummy_header [ap]) in
       let q = API.Compile.query p aq in
-      let qp, qq = Quotation.quote_syntax q in
-      !: qp +! qq)),
+      assert false;
+      (* let qp, qq = Quotation.quote_syntax q in *)
+      (*!: qp +! qq*))),
   DocAbove);
 
   MLData loc;

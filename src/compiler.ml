@@ -62,14 +62,14 @@ let is_empty_amap { c2i; nargs; i2n; n2t; n2i } =
   StrMap.is_empty n2i
 
 let raw_mk_Arg s n  { c2i; nargs; i2n; n2t; n2i } =
-  let nc = Data.Symbols.allocate_Arg_symbol s nargs in
+  let s, nc = Data.Symbols.allocate_Arg_symbol s nargs in
   let n' = Constants.mkConst nc in
   let i2n = IntMap.add nargs n i2n in
   let c2i = Constants.Map.add nc nargs c2i in
   let n2t = StrMap.add n (n',nc) n2t in
   let n2i = StrMap.add n nargs n2i in
   let nargs = nargs + 1 in
-  { c2i; nargs; i2n; n2t; n2i }, (n', nc)
+  s, { c2i; nargs; i2n; n2t; n2i }, (n', nc)
 
 type preterm = {
   term : Data.term; (* Args are still constants *)
@@ -237,7 +237,7 @@ type 'a query = {
   query_arguments : 'a Query.arguments [@opaque];
   (* We pre-compile the query to ease the API *)
   initial_goal : term; assignments : term StrMap.t;
-  final_state : State.t;
+  compiler_state : State.t;
 }
 [@@deriving show]
 
@@ -458,11 +458,11 @@ module CustomFunctorCompilation = struct
 
   let compile_singlequote state x =
     match !singlequote with
-    | None -> state, snd (Symbols.allocate_global_symbol state x)
+    | None -> let state, (_,t) = Symbols.allocate_global_symbol state x in state, t
     | Some(_,f) -> f state x
   let compile_backtick state x =
     match !backtick with
-    | None -> state, snd (Symbols.allocate_global_symbol state x)
+    | None -> let state, (_,t) = Symbols.allocate_global_symbol state x in state, t
     | Some(_,f) -> f state x
 
 end
@@ -483,13 +483,13 @@ module ToDBL : sig
   val run : State.t -> StructuredAST.program -> State.t * Structured.program
 
   (* Exported since also used to flatten (here we "flatten" locals) *)
-  val prefix_const : State.t -> string list -> C.t -> C.t
-  val merge_modes : (mode * Loc.t) Map.t -> (mode * Loc.t) Map.t -> (mode * Loc.t) Map.t
+  val prefix_const : State.t -> string list -> C.t -> State.t * C.t
+  val merge_modes : State.t -> (mode * Loc.t) Map.t -> (mode * Loc.t) Map.t -> (mode * Loc.t) Map.t
   val merge_types :
     Structured.typ list ->
     Structured.typ list ->
     Structured.typ list
-  val merge_type_abbrevs :
+  val merge_type_abbrevs : State.t ->
     type_abbrev_declaration C.Map.t ->
     type_abbrev_declaration C.Map.t ->
     type_abbrev_declaration C.Map.t
@@ -499,11 +499,11 @@ module ToDBL : sig
     depth:int -> macro_declaration -> State.t ->
       Loc.t * Ast.Term.t -> State.t * preterm
   val query_preterm_of_function :
-    depth:int -> macro_declaration -> State.t -> 
+    depth:int -> macro_declaration -> State.t ->
     (State.t -> State.t * (Loc.t * term)) ->
       State.t * preterm
 
-  (* Exported for quations *)    
+  (* Exported for quations *)
   val lp : quotation
   val is_Arg : State.t -> term -> bool
   val fresh_Arg :
@@ -565,7 +565,7 @@ let temporary_compilation_at_runtime f s x =
   let s = set_argmap s empty_amap in
   let s = set_varmap s F.Map.empty in
   let s = set_mtm s None in
-  let s = State.set Data.BuiltInPredicate.builtins s (Constants.Set.empty,[]) in
+  let s = State.set Data.BuiltInPredicate.builtins s (StrSet.empty,Constants.Set.empty,[]) in
   let s, x = f s x in
   let s = State.set Data.while_compiling s false in
   s |> drop_argmap |> drop_varmap |> drop_mtm, x
@@ -580,10 +580,12 @@ let is_Arg state x =
   | _ -> false
 
 let mk_Arg state ~name ~args =
-  let { n2t } = get_argmap state in
   let state, (t, c) =
-    try state, StrMap.find name n2t
-    with Not_found -> update_argmap state (raw_mk_Arg state name) in
+    let amap = get_argmap state in
+    try state, StrMap.find name amap.n2t
+    with Not_found ->
+      let state, amap, tc = raw_mk_Arg state name amap in
+      set_argmap state amap, tc in
   match args with
   | [] -> state, t
   | x::xs -> state, App(c,x,xs)
@@ -635,14 +637,16 @@ let preterm_of_ast ?(on_type=false) loc ~depth:arg_lvl macro state ast =
        mk_Arg state ~name:(F.show f) ~args:[]
      else if is_macro_name f then
        stack_macro_of_ast inner curlvl state f
-     else if not on_type && BuiltInPredicate.is_declared state (fst (Symbols.allocate_global_symbol state f)) then
-       state, Builtin(Symbols.get_global_symbol f,[])
+     else if not on_type && BuiltInPredicate.is_declared_str state (F.show f) then
+       state, Builtin(fst(Symbols.get_global_symbol state f),[])
      else if CustomFunctorCompilation.is_backtick f then
        CustomFunctorCompilation.compile_backtick state f
      else if CustomFunctorCompilation.is_singlequote f then
        CustomFunctorCompilation.compile_singlequote state f
-     else state, snd (Symbols.allocate_global_symbol state f)
-  
+     else
+       let state, (_,t) = Symbols.allocate_global_symbol state f in
+       state, t
+
   and aux inner lvl state = function
     | Ast.Term.Const f when F.(equal f nilf) -> state, Term.Nil
     | Ast.Term.Const f -> stack_funct_of_ast inner lvl state f
@@ -685,7 +689,8 @@ let preterm_of_ast ?(on_type=false) loc ~depth:arg_lvl macro state ast =
        state, Term.Lam t'
     | Ast.Term.Lam (x,t) ->
        let orig_varmap = get_varmap state in
-       let state = update_varmap state (F.Map.add x (Data.mkConst lvl)) in
+       let state, c = Symbols.allocate_bound_symbol state lvl in
+       let state = update_varmap state (F.Map.add x c) in
        let state, t' = aux true (lvl+1) state t in
        set_varmap state orig_varmap, Term.Lam t'
     | Ast.Term.App (Ast.Term.App (f,l1),l2) ->
@@ -781,26 +786,26 @@ let query_preterm_of_ast ~depth macros state (loc, t) =
     F.Map.add n (body,loc) m
 
   let compile_type_abbrev lcs state { Ast.TypeAbbreviation.name; nparams; loc; value } =
-    let taname, _ = Symbols.allocate_global_symbol state name in
+    let state, (taname, _) = Symbols.allocate_global_symbol state name in
     let state, tavalue = preterms_of_ast ~on_type:true loc ~depth:lcs F.Map.empty state (fun ~depth state x -> state, [loc,x]) value in
     let tavalue = assert(List.length tavalue = 1); List.hd tavalue in
     if tavalue.amap.nargs != 0 then
-      error ~loc ("type abbreviation for " ^ C.show taname ^ " has unbound variables");
+      error ~loc ("type abbreviation for " ^ F.show name ^ " has unbound variables");
     state, { taname; tavalue; taparams = nparams; taloc = loc }
 
-  let add_to_index_type_abbrev m ({ taname; taloc; tavalue; taparams } as x) =
+  let add_to_index_type_abbrev state m ({ taname; taloc; tavalue; taparams } as x) =
     if C.Map.mem taname m then begin
       let { taloc = otherloc; tavalue = othervalue; taparams = otherparams } =
         C.Map.find taname m in
       if taparams != otherparams || othervalue.term != tavalue.term then
       error ~loc:taloc
-        ("duplicate type abbreviation for " ^ C.show taname ^
+        ("duplicate type abbreviation for " ^ Symbols.show state taname ^
           ". Previous declaration: " ^ Loc.show otherloc)
     end;
     C.Map.add taname x m
 
   let compile_type lcs state { Ast.Type.attributes; loc; name; ty } =
-    let tname, _ = Symbols.allocate_global_symbol state name in
+    let state, (tname, _) = Symbols.allocate_global_symbol state name in
     let state, ttype = preterms_of_ast ~on_type:true loc ~depth:lcs F.Map.empty state (fun ~depth state x -> state, [loc,x]) ty in
     let ttype = assert(List.length ttype = 1); List.hd ttype in
     state, { Structured.tindex = attributes; decl = { tname; ttype; tloc = loc } }
@@ -808,32 +813,34 @@ let query_preterm_of_ast ~depth macros state (loc, t) =
    let funct_of_ast state c =
      try
        match F.Map.find c (get_varmap state) with
-       | Const x -> x
+       | Const x -> state, x
        | _ -> assert false
-     with Not_found -> fst (Symbols.allocate_global_symbol state c)
+     with Not_found ->
+       let state, (c,_) = Symbols.allocate_global_symbol state c in
+       state, c
 
-  let check_duplicate_mode name (mode, loc) map =
+  let check_duplicate_mode state name (mode, loc) map =
     if C.Map.mem name map && fst (C.Map.find name map) <> mode then
       error ~loc
-       ("Duplicate mode declaration for " ^ C.show name ^ " (also at "^
+       ("Duplicate mode declaration for " ^ Symbols.show state name ^ " (also at "^
          Loc.show (snd (C.Map.find name map)) ^ ")")
 
-  let compile_mode state modes { Ast.Mode.name; args; loc } =
-    let mname = funct_of_ast state name in
-    check_duplicate_mode mname (args,loc) modes;
-    C.Map.add mname (args,loc) modes
+  let compile_mode (state, modes) { Ast.Mode.name; args; loc } =
+    let state, mname = funct_of_ast state name in
+    check_duplicate_mode state mname (args,loc) modes;
+    state, C.Map.add mname (args,loc) modes
 
-  let merge_modes m1 m2 =
+  let merge_modes state m1 m2 =
     C.Map.fold (fun k v m ->
-      check_duplicate_mode k v m;
+      check_duplicate_mode state k v m;
       C.Map.add k v m)
     m2 m1
 
   let merge_types t1 t2 =
     t1 @ (List.filter (fun x -> not @@ List.mem x t1) t2)
 
-  let merge_type_abbrevs m1 m2 =
-    C.Map.fold (fun _ v m -> add_to_index_type_abbrev m v) m1 m2
+  let merge_type_abbrevs s m1 m2 =
+    C.Map.fold (fun _ v m -> add_to_index_type_abbrev s m v) m1 m2
 
   let rec toplevel_clausify loc ~depth state t =
     let state, cl = map_acc (pi2arg loc ~depth []) state (R.split_conj ~depth t) in
@@ -856,9 +863,9 @@ let query_preterm_of_ast ~depth macros state (loc, t) =
       lcs, state, cl :: rest
 
   let compile_shorthand state { StructuredAST.full_name; short_name; iloc } = 
-    let full_name = funct_of_ast state full_name in
-    let short_name = funct_of_ast state short_name in
-  { StructuredAST.full_name; short_name; iloc }
+    let state, full_name = funct_of_ast state full_name in
+    let state, short_name = funct_of_ast state short_name in
+    state, { StructuredAST.full_name; short_name; iloc }
 
   let rec append_body b1 b2 =
     match b1, b2 with
@@ -893,19 +900,21 @@ let query_preterm_of_ast ~depth macros state (loc, t) =
   let namespace_separator = "."
 
   let prefix_const state prefix c =
-    let c' =
       Symbols.allocate_global_symbol_str state
         (String.concat namespace_separator prefix ^
                       namespace_separator ^
-                      C.show c) in
-    (* Printf.eprintf "%s -> %s\n" (C.show c) (C.show c'); *)
-    c'
+                      Symbols.show state c)
 
   let prepend state p s =
-    (* XXX OCaml 4.04: C.Set.map (prefix_const [p]) s *)
     let res = ref C.Set.empty in
-    C.Set.iter (fun x -> res := C.Set.add (prefix_const state [p] x) !res) s;
-    !res
+    let state = C.Set.fold
+      (fun x state ->
+         let state, c = prefix_const state [p] x in
+         res := C.Set.add c !res;
+         state)
+      s
+      state in
+    state, !res
 
 
   let run (state : State.t) p =
@@ -915,11 +924,10 @@ let query_preterm_of_ast ~depth macros state (loc, t) =
       let active_macros =
         List.fold_left compile_macro omacros macros in
       let state, type_abbrevs = map_acc (compile_type_abbrev lcs) state type_abbrevs in
-      let type_abbrevs = List.fold_left add_to_index_type_abbrev C.Map.empty type_abbrevs in
+      let type_abbrevs = List.fold_left (add_to_index_type_abbrev state) C.Map.empty type_abbrevs in
       let state, types =
         map_acc (compile_type lcs) state types in
-      let modes =
-        List.fold_left (compile_mode state) C.Map.empty modes in
+      let state, modes = List.fold_left compile_mode (state,C.Map.empty) modes in
       let defs_m = defs_of_modes modes in
       let defs_t = defs_of_types types in
       let defs_ta = defs_of_type_abbrevs type_abbrevs in
@@ -935,7 +943,7 @@ let query_preterm_of_ast ~depth macros state (loc, t) =
           let orig_varmap = get_varmap state in
           let lcs, state =
             List.fold_left (fun (lcs,state) name ->
-              let rel = Data.mkConst lcs in
+              let state, rel = Symbols.allocate_bound_symbol state lcs in
               lcs+1, update_varmap state (F.Map.add name rel))
             (lcs,state) nlist in
           let state, lcs, _,
@@ -943,9 +951,9 @@ let query_preterm_of_ast ~depth macros state (loc, t) =
             =
             compile_program macros lcs state p in
           let defs = C.Set.union defs symbols in
-          let modes = merge_modes modes mp in
+          let modes = merge_modes state modes mp in
           let types = merge_types types tp in
-          let type_abbrevs = merge_type_abbrevs type_abbrevs ta in
+          let type_abbrevs = merge_type_abbrevs state type_abbrevs ta in
           let state = set_varmap state orig_varmap in
           let lcs, state, types, type_abbrevs, modes, defs, compiled_rest =
             compile_body macros types type_abbrevs modes lcs defs state rest in
@@ -964,11 +972,11 @@ let query_preterm_of_ast ~depth macros state (loc, t) =
           let state, lcs, _, p = compile_program macros lcs state p in
           let lcs, state, types, type_abbrevs, modes, defs, compiled_rest =
             compile_body macros types type_abbrevs modes lcs defs state rest in
-          lcs, state, types, type_abbrevs, modes,
-          C.Set.union defs (prepend state prefix p.Structured.symbols),
+          let state, symbols = prepend state prefix p.Structured.symbols in
+          lcs, state, types, type_abbrevs, modes, C.Set.union defs symbols,
           Structured.Namespace(prefix, p) :: compiled_rest
       | Shorten(shorthands,p) :: rest ->
-          let shorthands = List.map (compile_shorthand state) shorthands in
+          let state, shorthands = map_acc compile_shorthand state shorthands in
           let shorts = List.fold_left (fun s { short_name } ->
             C.Set.add short_name s) C.Set.empty shorthands in
           let state, lcs, _, p = compile_program macros lcs state p in
@@ -979,7 +987,7 @@ let query_preterm_of_ast ~depth macros state (loc, t) =
           Structured.Shorten(shorthands, p) :: compiled_rest
       | Constraints (clique, rules, p) :: rest ->
           (* XXX missing check for nested constraints *)
-          let clique = List.map (funct_of_ast state) clique in
+          let state, clique = map_acc funct_of_ast state clique in
           let state, rules =
             map_acc (prechr_rule_of_ast lcs macros) state rules in
           let state, lcs, _, p = compile_program macros lcs state p in
@@ -1024,7 +1032,7 @@ end = struct (* {{{ *)
           let c1 = f c in
           if c == c1 then x else
           if not on_type && BuiltInPredicate.is_declared state c1 then Builtin(c1,[])
-          else Data.mkConst c1
+          else Symbols.get_canonical state c1
       | Lam t as x ->
           let t1 = aux t in
           if t == t1 then x else Lam t1
@@ -1040,7 +1048,7 @@ end = struct (* {{{ *)
           let ts1 = smart_map aux ts in
           if c == c1 && ts == ts1 then x
           else if not on_type && BuiltInPredicate.is_declared state c1 then Builtin(c,ts1)
-          else if ts1 = [] then Data.mkConst c1 else App(c,List.hd ts1,List.tl ts1)
+          else if ts1 = [] then Symbols.get_canonical state c1 else App(c,List.hd ts1,List.tl ts1)
       | App(c,t,ts) as x ->
           let c1 = f c in
           let t1 = aux t in
@@ -1091,9 +1099,9 @@ end = struct (* {{{ *)
   let map_clause state f ({ Ast.Clause.body } as x) =
     { x with Ast.Clause.body = smart_map_preterm state f body }
 
-  type subst = (string list * (C.t -> C.t))
+  type subst = (string list * C.t C.Map.t)
 
-  let apply_subst (f : (C.t -> C.t) -> 'a -> 'a) (s : subst) : 'a -> 'a =
+  let apply_subst (f : C.t C.Map.t -> 'a -> 'a) (s : subst) : 'a -> 'a =
     fun x -> f (snd s) x
 
   let apply_subst_list f = apply_subst (fun x -> smart_map (f x))
@@ -1106,31 +1114,31 @@ end = struct (* {{{ *)
       C.Map.add taname { taname; tavalue; taparams; taloc } m
       ) m C.Map.empty
 
-  let apply_subst_constant = apply_subst (fun f x -> f x)
+  let apply_subst_constant = apply_subst (fun m x -> try C.Map.find x m with Not_found -> x)
 
-  let apply_subst_types st = apply_subst_list (smart_map_type st)
+  let apply_subst_types st s = smart_map (smart_map_type st (apply_subst_constant s))
 
-  let apply_subst_type_abbrevs st = apply_subst (tabbrevs_map st)
+  let apply_subst_type_abbrevs st s = tabbrevs_map st (apply_subst_constant s)
 
-  let apply_subst_modes =
-    apply_subst (fun f modes ->
-       C.Map.fold (fun c v m -> C.Map.add (f c) v m) modes C.Map.empty)
+  let apply_subst_modes s m =
+    C.Map.fold (fun c v m -> C.Map.add (apply_subst_constant s c) v m) m C.Map.empty
 
-  let apply_subst_chr st = apply_subst_list (map_chr st)
+  let apply_subst_chr st s = smart_map (map_chr st (apply_subst_constant s))
 
-  let apply_subst_clauses st = apply_subst_list (map_clause st)
+  let apply_subst_clauses st s = smart_map (map_clause st (apply_subst_constant s))
 
   let push_subst state extra_prefix symbols_affected (oldprefix, oldsubst) =
     let newprefix = oldprefix @ [extra_prefix] in
-    let newsubst c =
-      if C.Set.mem c symbols_affected then ToDBL.prefix_const state newprefix c
-      else oldsubst c in
-    (newprefix, newsubst)
+    let state, newsubst =
+      C.Set.fold (fun c (state,subst) ->
+        let state, c1 = ToDBL.prefix_const state newprefix c in
+        state, C.Map.add c c1 subst) symbols_affected (state, oldsubst) in
+    state, (newprefix, newsubst)
 
   let push_subst_shorthands shorthands _symbols_defined (oldprefix, oldsubst) =
-    let push1 subst { StructuredAST.short_name; full_name } c =
-      if c == short_name then subst full_name
-      else subst c
+    let push1 m { StructuredAST.short_name; full_name } =
+      C.Map.add short_name
+        (try C.Map.find full_name m with Not_found -> full_name) m
     in
     oldprefix, List.fold_left push1 oldsubst shorthands
 
@@ -1140,16 +1148,16 @@ end = struct (* {{{ *)
     | Shorten(shorthands, { types = t; type_abbrevs = ta; modes = m; body; symbols }) :: rest ->
         let insubst = push_subst_shorthands shorthands symbols subst in
         let types = ToDBL.merge_types (apply_subst_types state insubst t) types in
-        let type_abbrevs = ToDBL.merge_type_abbrevs (apply_subst_type_abbrevs state insubst ta) type_abbrevs in
-        let modes = ToDBL.merge_modes (apply_subst_modes insubst m) modes in
+        let type_abbrevs = ToDBL.merge_type_abbrevs state (apply_subst_type_abbrevs state insubst ta) type_abbrevs in
+        let modes = ToDBL.merge_modes state (apply_subst_modes insubst m) modes in
         let types, type_abbrevs, modes, clauses, chr =
           compile_body state lcs types type_abbrevs modes clauses chr insubst body in
         compile_body state lcs types type_abbrevs modes clauses chr subst rest
     | Namespace (extra, { types = t; type_abbrevs = ta; modes = m; body; symbols }) :: rest ->
-        let insubst = push_subst state extra symbols subst in
+        let state, insubst = push_subst state extra symbols subst in
         let types = ToDBL.merge_types (apply_subst_types state insubst t) types in
-        let type_abbrevs = ToDBL.merge_type_abbrevs (apply_subst_type_abbrevs state insubst ta) type_abbrevs in
-        let modes = ToDBL.merge_modes (apply_subst_modes insubst m) modes in
+        let type_abbrevs = ToDBL.merge_type_abbrevs state (apply_subst_type_abbrevs state insubst ta) type_abbrevs in
+        let modes = ToDBL.merge_modes state (apply_subst_modes insubst m) modes in
         let types, type_abbrevs, modes, clauses, chr =
           compile_body state lcs types type_abbrevs modes clauses chr insubst body in
         compile_body state lcs types type_abbrevs modes clauses chr subst rest
@@ -1159,8 +1167,8 @@ end = struct (* {{{ *)
         compile_body state lcs types type_abbrevs modes clauses chr subst rest
     | Constraints (clique, rules, { types = t; type_abbrevs = ta; modes = m; body }) :: rest ->
         let types = ToDBL.merge_types t types in
-        let type_abbrevs = ToDBL.merge_type_abbrevs ta type_abbrevs in
-        let modes = ToDBL.merge_modes m modes in
+        let type_abbrevs = ToDBL.merge_type_abbrevs state ta type_abbrevs in
+        let modes = ToDBL.merge_modes state m modes in
         let clique = List.map (apply_subst_constant subst) clique in
         let rules = apply_subst_chr state subst rules in
         let chr = (clique, rules) :: chr in
@@ -1175,7 +1183,7 @@ end = struct (* {{{ *)
     }
   =
     let types, type_abbrevs, modes, clauses, chr =
-      compile_body state local_names types type_abbrevs modes [] [] ([],fun x -> x) body in
+      compile_body state local_names types type_abbrevs modes [] [] ([],C.Map.empty) body in
     { Flat.types;
       type_abbrevs;
       modes;
@@ -1217,7 +1225,7 @@ end = struct (* {{{ *)
     with
       Not_found -> `Unknown
 
-  let missing_args_of loc modes types t =
+  let missing_args_of state loc modes types t =
     let c, args =
       let rec aux = function
         | App (c,_,[x]) when c == Data.Symbols.implc -> aux x
@@ -1246,23 +1254,31 @@ end = struct (* {{{ *)
           if missing > output_suffix then
             error ~loc Printf.(sprintf
               "Cannot spill %s: only %d out of %d missing arguments are output"
-              (C.show c) output_suffix missing);
+              (Symbols.show state c) output_suffix missing);
           missing
-      | _ -> error ~loc ("Cannot spill: unknown arity of " ^ C.show c) in
+      | _ -> error ~loc ("Cannot spill: unknown arity of " ^ Symbols.show state c) in
     if missing_args <= 0 then
-      error ~loc ("Cannot spill: " ^ C.show c ^ " is fully applied");
+      error ~loc ("Cannot spill: " ^ Symbols.show state c ^ " is fully applied");
     missing_args
 
   let spill_term state loc modes types argmap term =
 
     let argmap = ref argmap in
+    let state = ref state in
+
     let mk_Arg n =
-      let m, (x,_) = raw_mk_Arg state n !argmap in
+      let s, m, (x,_) = raw_mk_Arg !state n !argmap in
       argmap := m;
+      state := s;
+      x in
+
+    let allocate_bound_symbol n =
+      let s, x = Symbols.allocate_bound_symbol !state n in
+      state := s;
       x in
 
     let mkAppC c = function
-      | [] -> Data.mkConst c
+      | [] -> Symbols.get_canonical !state c
       | x::xs -> App(c,x,xs) in
 
     let mkApp hd args =
@@ -1320,10 +1336,10 @@ end = struct (* {{{ *)
          assert (rest = []);
          let spills, fcall = spaux1 ctx fcall in
          let args =
-            mkSpilled (List.rev vars) (missing_args_of loc modes types fcall) in
+            mkSpilled (List.rev vars) (missing_args_of !state loc modes types fcall) in
          spills @ [args, mkAppSpilled fcall args], args
       | App(c, Lam arg, []) when c == Data.Symbols.pic ->
-         let ctx = depth+1, Data.mkConst depth :: vars in
+         let ctx = depth+1, allocate_bound_symbol depth :: vars in
          let spills, arg = spaux1 ctx arg in
          [], [mkAppC c [Lam (add_spilled spills arg)]]
       | App(c, Lam arg, []) when c == Data.Symbols.sigmac ->
@@ -1373,11 +1389,11 @@ end = struct (* {{{ *)
            sp @ sp1, x) [] args in
          [], [add_spilled spills (Builtin(c,List.concat args))]
       | Lam t ->
-         let sp, t = spaux1 (depth+1, Data.mkConst depth :: vars) t in
+         let sp, t = spaux1 (depth+1, allocate_bound_symbol depth :: vars) t in
          let (t,_), sp = map_acc (fun (t,n) (names, call) ->
                let all_names = names @ n in
-               let call = apply_to all_names (Data.mkConst depth) call in
-               let t = apply_to names (Data.mkConst depth) t in
+               let call = apply_to all_names (allocate_bound_symbol depth) call in
+               let t = apply_to names (allocate_bound_symbol depth) t in
                (t,all_names), (names, mkAppC Data.Symbols.pic [Lam call])
            ) (t,[]) sp in
          sp, [Lam t]
@@ -1496,13 +1512,13 @@ end (* }}} *)
 (* Compiler passes *)
 let unit_of_ast s p =
   let { print_passes } = State.get compiler_flags s in
-  Data.Symbols.current_table := State.get Data.Symbols.table s;
+  (* Data.Symbols.current_table := State.get Data.Symbols.table s; *)
 
   if print_passes then
     Format.eprintf "== AST ================@\n@[<v 0>%a@]@\n"
       Ast.Program.pp p;
  
-  let p = RecoverStructure.run  s p in
+  let p = RecoverStructure.run s p in
  
   if print_passes then
     Format.eprintf "== StructuredAST ================@\n@[<v 0>%a@]@\n"
@@ -1545,12 +1561,12 @@ let check_all_builtin_are_typed state types =
      if not (List.exists
         (fun { Structured.tindex; decl = { tname }} ->
             tindex = StructuredAST.External && tname == c) types) then
-       error ("Built-in without external type declaration: " ^ C.show c))
+       error ("Built-in without external type declaration: " ^ Symbols.show state c))
    (BuiltInPredicate.all state);
   List.iter (fun { Structured.tindex; decl = { tname; tloc }} ->
     if tindex = StructuredAST.External && not (is_builtin state tname) then
       error ~loc:tloc ("external type declaration without Built-in: " ^
-            C.show tname))
+            Symbols.show state tname))
   types
 ;;
 
@@ -1558,15 +1574,20 @@ let check_no_regular_types_for_builtins state types =
   List.iter (fun {Structured.tindex; decl = { tname; tloc } } ->
     if tindex <> StructuredAST.External && is_builtin state tname then
       anomaly ~loc:tloc ("type declaration for Built-in " ^
-            C.show tname ^ " must be flagged as external");
+            Symbols.show state tname ^ " must be flagged as external");
  ) types
 
-let stack_term_of_preterm ~depth:arg_lvl { term = t; amap = { c2i } } =
+let stack_term_of_preterm ~depth:arg_lvl state { term = t; amap = { c2i } } =
+  let state = ref state in
+  let get_global_or_allocate_bound_symbol n =
+    let s, t = Symbols.get_global_or_allocate_bound_symbol !state n in
+    state := s;
+    t in
   let rec stack_term_of_preterm = function
     | Const c when C.Map.mem c c2i ->
         let argno = C.Map.find c c2i in
         R.mkAppArg argno arg_lvl []
-    | Const c -> Data.mkConst c
+    | Const c -> get_global_or_allocate_bound_symbol c
     | App(c, x, xs) when C.Map.mem c c2i ->
         let argno = C.Map.find c c2i in
         R.mkAppArg argno arg_lvl (List.map stack_term_of_preterm (x::xs))
@@ -1589,7 +1610,8 @@ let stack_term_of_preterm ~depth:arg_lvl { term = t; amap = { c2i } } =
         let tl1 = stack_term_of_preterm tl in
         if hd == hd1 && tl == tl1 then x else Cons(hd1,tl1)
   in
-  stack_term_of_preterm t
+  let t = stack_term_of_preterm t in
+  !state, t
 ;;
 
 let uvbodies_of_assignments assignments =
@@ -1603,7 +1625,7 @@ let uvbodies_of_assignments assignments =
      | _ -> assert false) assignments)
 
 let query_of_ast compiler_state assembled_program t =
-  Data.Symbols.current_table := State.get Data.Symbols.table compiler_state;
+  (* Data.Symbols.current_table := State.get Data.Symbols.table compiler_state; *)
   let initial_depth = assembled_program.Assembled.local_names in
   let types = assembled_program.Assembled.types in
   let type_abbrevs = assembled_program.Assembled.type_abbrevs in
@@ -1613,9 +1635,10 @@ let query_of_ast compiler_state assembled_program t =
     ToDBL.query_preterm_of_ast ~depth:initial_depth active_macros compiler_state t in
   let query = Spill.spill_preterm state types (fun c -> C.Map.find c modes) query in
   let query_env = Array.make query.amap.nargs Data.dummy in
+  let state, queryt = stack_term_of_preterm ~depth:initial_depth state query in
   let initial_goal =
     R.move ~adepth:initial_depth ~from:initial_depth ~to_:initial_depth query_env
-      (stack_term_of_preterm ~depth:initial_depth query) in
+      queryt in
   let assignments = StrMap.map (fun i -> query_env.(i)) query.amap.n2i in
   {
     WithMain.types;
@@ -1628,11 +1651,11 @@ let query_of_ast compiler_state assembled_program t =
     query_arguments = Query.N;
     initial_goal;
     assignments;
-    final_state = state |> (uvbodies_of_assignments assignments);
+    compiler_state = state |> (uvbodies_of_assignments assignments);
   }
 
 let query_of_term compiler_state assembled_program f =
-  Data.Symbols.current_table := State.get Data.Symbols.table compiler_state;
+  (* Data.Symbols.current_table := State.get Data.Symbols.table compiler_state; *)
   let initial_depth = assembled_program.Assembled.local_names in
   let types = assembled_program.Assembled.types in
   let type_abbrevs = assembled_program.Assembled.type_abbrevs in
@@ -1643,9 +1666,10 @@ let query_of_term compiler_state assembled_program f =
       ~depth:initial_depth active_macros compiler_state
       (f ~depth:initial_depth) in
   let query_env = Array.make query.amap.nargs Data.dummy in
+    let state, queryt = stack_term_of_preterm ~depth:initial_depth state query in
   let initial_goal =
     R.move ~adepth:initial_depth ~from:initial_depth ~to_:initial_depth query_env
-      (stack_term_of_preterm ~depth:initial_depth query) in
+      queryt in
   let assignments = StrMap.map (fun i -> query_env.(i)) query.amap.n2i in
  {
     WithMain.types;
@@ -1658,7 +1682,7 @@ let query_of_term compiler_state assembled_program f =
     query_arguments = Query.N;
     initial_goal;
     assignments;
-    final_state = state |> (uvbodies_of_assignments assignments);
+    compiler_state = state |> (uvbodies_of_assignments assignments);
   }
 
 
@@ -1677,7 +1701,7 @@ module Compiler : sig
 
 end = struct (* {{{ *)
 
-let compile_chr depth
+let compile_chr depth state
     { pto_match; pto_remove; pguard; pnew_goal; pamap; pname; pcloc = loc }
 =
   if depth > 0 then error ~loc "CHR: rules and locals are not supported";
@@ -1686,33 +1710,38 @@ let compile_chr depth
     | Const x -> x
     | App(x,_,_) -> x
     | f -> error ~loc "CHR: rule without head symbol" in
-  let stack_term_of_preterm term =
-    stack_term_of_preterm ~depth:0 { term; amap = pamap; loc } in
-  let stack_sequent_of_presequent { pcontext; pconclusion; peigen } =
-    let context = stack_term_of_preterm pcontext in
-    let conclusion = stack_term_of_preterm pconclusion in
-    let eigen = stack_term_of_preterm peigen in
-    { CHR.context; conclusion; eigen } in
+  let stack_term_of_preterm s term =
+    stack_term_of_preterm ~depth:0 s { term; amap = pamap; loc } in
+  let stack_sequent_of_presequent s { pcontext; pconclusion; peigen } =
+    let s, context = stack_term_of_preterm s pcontext in
+    let s, conclusion = stack_term_of_preterm s pconclusion in
+    let s, eigen = stack_term_of_preterm s peigen in
+    s, { CHR.context; conclusion; eigen } in
   let all_sequents = pto_match @ pto_remove in
   let pattern = List.map key_of_sequent all_sequents in
-  { CHR.to_match = List.map stack_sequent_of_presequent pto_match;
-        to_remove = List.map stack_sequent_of_presequent pto_remove;
+  let state, to_match = map_acc stack_sequent_of_presequent state pto_match in
+  let state, to_remove = map_acc stack_sequent_of_presequent state pto_remove in
+  let state, guard = option_mapacc stack_term_of_preterm state pguard in
+  let state, new_goal = option_mapacc stack_sequent_of_presequent state pnew_goal in
+  state, {
+    CHR.to_match;
+        to_remove;
         patsno = List.(length pto_match + length pto_remove);
-        guard = option_map stack_term_of_preterm pguard;
-        new_goal = option_map stack_sequent_of_presequent pnew_goal;
+        guard;
+        new_goal;
         nargs = pamap.nargs;
         pattern;
         rule_name = pname;
       }
 ;;
 
-let compile_clause modes initial_depth
+let compile_clause modes initial_depth state
     { Ast.Clause.body = ({ amap = { nargs }} as body); loc }
 =
-  let body = stack_term_of_preterm ~depth:0 body in
+  let state, body = stack_term_of_preterm ~depth:0 state body in
   let cl, _, morelcs = R.clausify1 ~loc modes ~nargs ~depth:initial_depth body in
   if morelcs <> 0 then error ~loc "sigma in a toplevel clause is not supported";
-  cl
+  state, cl
 
 let rec filter_if defs proj = function
   | [] -> []
@@ -1723,24 +1752,24 @@ let rec filter_if defs proj = function
     | Some _ -> filter_if defs proj rest
 
 
-let chose_indexing predicate l =
+let chose_indexing state predicate l =
   let rec all_zero = function
     | [] -> true
     | 0 :: l -> all_zero l
     | _ -> false in
   let rec aux n = function
-    | [] -> error ("Wrong indexing for " ^ C.show predicate)
+    | [] -> error ("Wrong indexing for " ^ Symbols.show state predicate)
     | 0 :: l -> aux (n+1) l
     | 1 :: l when all_zero l -> MapOn n
     | _ -> Hash l
   in
     aux 0 l
 
-let check_rule_pattern_in_clique clique { Data.CHR.pattern; rule_name } =
+let check_rule_pattern_in_clique state clique { Data.CHR.pattern; rule_name } =
   try
     let outside =
       List.find (fun x -> not (Data.CHR.in_clique clique x)) pattern in
-    error ("CHR rule " ^ rule_name ^ ": matches " ^ C.show outside ^
+    error ("CHR rule " ^ rule_name ^ ": matches " ^ Symbols.show state outside ^
       " which is not a constraint on which it is applied. Check the list of predicates after the \"constraint\" keyword.");
   with Not_found -> ()
 
@@ -1753,25 +1782,25 @@ let run
     initial_depth;
     initial_goal;
     assignments;
-    final_state;
+    compiler_state = state;
     query_arguments;
   }
 =
-  Data.Symbols.current_table := State.get Data.Symbols.table final_state;
-  let flags = State.get compiler_flags final_state in
+  (* Data.Symbols.current_table := State.get Data.Symbols.table state; *)
+  let flags = State.get compiler_flags state in
   if not flags.allow_untyped_builtin then
-    check_all_builtin_are_typed final_state types;
-  check_no_regular_types_for_builtins final_state types;
+    check_all_builtin_are_typed state types;
+  check_no_regular_types_for_builtins state types;
   (* Real Arg nodes: from "Const '%Arg3'" to "Arg 3" *)
   let pifexpr { pifexpr } = pifexpr in
-  let chr =
-    List.fold_left (fun chr (clique, rules) ->
+  let state, chr =
+    List.fold_left (fun (state, chr) (clique, rules) ->
       let chr, clique = CHR.new_clique clique chr in
-      let rules = filter_if flags.defined_variables pifexpr rules in 
-      let rules = List.map (compile_chr initial_depth) rules in
-      List.iter (check_rule_pattern_in_clique clique) rules;
-      List.fold_left (fun x y -> CHR.add_rule clique y x) chr rules)
-    CHR.empty chr in
+      let rules = filter_if flags.defined_variables pifexpr rules in
+      let state, rules = map_acc (compile_chr initial_depth) state rules in
+      List.iter (check_rule_pattern_in_clique state clique) rules;
+      state, List.fold_left (fun x y -> CHR.add_rule clique y x) chr rules)
+    (state, CHR.empty) chr in
   let ifexpr { Ast.Clause.attributes = { Assembled.ifexpr } } = ifexpr in
   let indexing =
     let known =
@@ -1790,26 +1819,28 @@ let run
         | [] -> [1]
         | [x] -> x
         | _ -> error ("multiple and inconsistent indexing attributes for " ^
-                      C.show name) in
-      C.Map.add name (mode,chose_indexing name index) m) known C.Map.empty in
-  let prolog_program =
-    R.make_index ~depth:initial_depth ~indexing
-      (List.map (compile_clause modes initial_depth)
-        (filter_if flags.defined_variables ifexpr clauses)) in
+                      Symbols.show state name) in
+      C.Map.add name (mode,chose_indexing state name index) m) known C.Map.empty in
+  let clauses = filter_if flags.defined_variables ifexpr clauses in
+  let state, clauses =
+    map_acc (compile_clause modes initial_depth) state clauses in
+  let prolog_program = R.make_index ~depth:initial_depth ~indexing clauses in
   let symbol_table =
-    State.get Data.Symbols.table final_state in
+    State.get Data.Symbols.table state in
   let builtins = Hashtbl.create 17 in
+  let _,_,pred_list = State.get Data.BuiltInPredicate.builtins state in
   List.iter
     (fun (Data.BuiltInPredicate.Pred(s,_,_) as p) ->
-      let c = Data.Symbols.get_global_symbol_str s in
+      let c, _ = Data.Symbols.get_global_symbol_str state s in
       Hashtbl.add builtins c p)
-    (snd (State.get Data.BuiltInPredicate.builtins final_state));
+    pred_list;
+  let symbol_table = Data.Symbols.compile symbol_table in
   {
     Data.compiled_program = prolog_program;
     chr;
     initial_depth;
     initial_goal;
-    initial_runtime_state = State.end_compilation final_state;
+    initial_runtime_state = State.end_compilation state;
     assignments;
     query_arguments;
     symbol_table;
@@ -1826,14 +1857,15 @@ let pp_query pp fmt {
     clauses;
     chr;
     initial_depth;
+    compiler_state;
     query; } =
   Format.fprintf fmt "@[<v>";
   List.iter (fun { Ast.Clause.body } ->
     Format.fprintf fmt "%a.@;" (pp ~depth:initial_depth)
-      (stack_term_of_preterm ~depth:initial_depth body))
+      (snd(stack_term_of_preterm compiler_state ~depth:initial_depth body)))
   clauses;
   Format.fprintf fmt "?- %a.@;" (pp ~depth:initial_depth)
-    (stack_term_of_preterm ~depth:initial_depth query);
+    (snd (stack_term_of_preterm compiler_state ~depth:initial_depth query));
   Format.fprintf fmt "@]"
 ;;
 
@@ -1860,22 +1892,26 @@ let mkQApp ~on_type l =
   let c = if on_type then tappc else appc in
   App(c,R.list_to_lp_list l,[])
 
-let mkQCon ~on_type ?(amap=empty_amap) c =
-  try Data.mkConst (C.Map.find c amap.c2i)
+let mkQCon ~compiler_state new_state ~on_type ?(amap=empty_amap) c =
+  try Data.Symbols.allocate_bound_symbol new_state (C.Map.find c amap.c2i)
   with Not_found ->
     let a = if on_type then tconstc else constc in
-    if c < 0 then App(a,Data.C.of_string (C.show c),[])
-    else Data.mkConst (c + amap.nargs)
+    if c < 0 then new_state, App(a,Data.C.of_string (Symbols.show compiler_state c),[])
+    else Data.Symbols.allocate_bound_symbol new_state (c + amap.nargs)
 
-let quote_preterm ?(on_type=false) { term; amap } =
+let quote_preterm ~compiler_state new_state ?(on_type=false) { term; amap } =
+  let new_state = ref new_state in
   let mkQApp = mkQApp ~on_type in
-  let mkQCon = mkQCon ~on_type ~amap in
+  let mkQCon c =
+    let n, x = mkQCon ~compiler_state !new_state ~on_type ~amap c in
+    new_state := n;
+    x in
   let rec aux depth term = match term with
     | App(c,CData s,[])
       when on_type && c == Data.Symbols.ctypec && Data.C.is_string s -> term
     | App(c,s,[t]) when on_type && c == Data.Symbols.arrowc ->
         App(arrowc,aux depth s,[aux depth t])
-    | Const n when on_type && C.show n = "prop" -> term
+    | Const n when on_type && Symbols.show compiler_state n = "prop" -> term
 
     | Const n -> mkQCon n
     | Builtin(c,[]) -> mkQCon c
@@ -1904,7 +1940,8 @@ let quote_preterm ?(on_type=false) { term; amap } =
     | Nil -> mkQCon Data.Symbols.nilc
     | Discard -> mkQCon discardc
   in
-    aux amap.nargs term
+  let term = aux amap.nargs term in
+  !new_state, term
 
 (* FIXME : close_with_pis already exists but unused *)
 let close_w_binder binder t { nargs } =
@@ -1925,11 +1962,12 @@ let quote_loc ?id loc =
     | None -> loc.Loc.source_name in
   Ast.cloc.CData.cin { loc with Loc.source_name }
 
-let quote_clause { Ast.Clause.loc; attributes = { Assembled.id }; body } =
+let quote_clause ~compiler_state new_state { Ast.Clause.loc; attributes = { Assembled.id }; body } =
   let clloc = quote_loc ?id loc in
-  let qt = close_w_binder argc (quote_preterm body) body.amap in
+  let new_state, bodyt = quote_preterm ~compiler_state new_state body in
+  let qt = close_w_binder argc bodyt body.amap in
   let names = sorted_names_of_argmap body.amap in
-  App(clausec,CData clloc,[R.list_to_lp_list names; qt])
+  new_state, App(clausec,CData clloc,[R.list_to_lp_list names; qt])
 ;;
 
 let rec lam2forall = function
@@ -1942,21 +1980,22 @@ let rec lam2forall = function
   | UVar _ | AppUVar _ -> assert false
   | Arg _ | AppArg _ -> assert false
 
-let quote_syntax { WithMain.clauses; query } =
+let quote_syntax new_state { WithMain.clauses; query; compiler_state } =
   let names = sorted_names_of_argmap query.amap in
-  let clist = List.map quote_clause clauses in
+  let new_state, clist = map_acc (quote_clause ~compiler_state) new_state clauses in
+  let new_state, queryt = quote_preterm ~on_type:false ~compiler_state new_state query in
   let q =
     App(clausec,CData (quote_loc ~id:"query" query.loc),
       [R.list_to_lp_list names;
-       close_w_binder argc (quote_preterm ~on_type:false query) query.amap]) in
-  clist, q
+       close_w_binder argc queryt query.amap]) in
+  new_state, clist, q
 
 let default_checker () =
   try Parser.parse_program
          ~print_accumulated_files:false ["elpi-checker.elpi"]
   with Parser.ParseError(loc,err) -> error ~loc err
 
-let unfold_type_abbrevs lcs type_abbrevs { term; loc; amap } =
+let unfold_type_abbrevs ~compiler_state lcs type_abbrevs { term; loc; amap } =
   let find_opt c =
     try Some (C.Map.find c type_abbrevs) with Not_found -> None in
   let rec aux seen = function
@@ -1964,11 +2003,11 @@ let unfold_type_abbrevs lcs type_abbrevs { term; loc; amap } =
         begin match find_opt c with
         | Some { tavalue; taparams } ->
           if taparams > 0 then
-            error ~loc ("type abbreviation " ^ C.show c ^ " needs " ^
+            error ~loc ("type abbreviation " ^ Symbols.show compiler_state c ^ " needs " ^
               string_of_int taparams ^ " arguments");
           if C.Set.mem c seen then
             error ~loc
-              ("looping while unfolding type abbreviation for "^ C.show c);
+              ("looping while unfolding type abbreviation for "^ Symbols.show compiler_state c);
           aux (C.Set.add c seen) tavalue.term
         | None -> x
         end
@@ -1977,12 +2016,12 @@ let unfold_type_abbrevs lcs type_abbrevs { term; loc; amap } =
         | Some { tavalue; taparams } ->
           let nargs = 1 + List.length ts in
           if taparams > nargs then
-            error ~loc ("type abbreviation " ^ C.show c ^ " needs " ^
+            error ~loc ("type abbreviation " ^ Symbols.show compiler_state c ^ " needs " ^
               string_of_int taparams ^ " arguments, only " ^
               string_of_int nargs ^ " are provided");
           if C.Set.mem c seen then
             error ~loc
-              ("looping while unfolding type abbreviation for "^ C.show c);
+              ("looping while unfolding type abbreviation for "^ Symbols.show compiler_state c);
           aux (C.Set.add c seen) (R.deref_appuv ~from:lcs ~to_:lcs (t::ts) tavalue.term)
         | None ->
           let t1 = aux seen t in
@@ -1997,9 +2036,12 @@ let unfold_type_abbrevs lcs type_abbrevs { term; loc; amap } =
 let term_of_ast ~depth state t =
  if State.get Data.while_compiling state then
    anomaly ("term_of_ast cannot be used at compilation time");
- let state, pt = ToDBL.temporary_compilation_at_runtime (ToDBL.query_preterm_of_ast ~depth F.Map.empty) state t in
- let t = stack_term_of_preterm ~depth pt in
- let env = Array.make pt.amap.nargs Data.dummy in
+ let state, (t,nargs) = ToDBL.temporary_compilation_at_runtime (fun s x ->
+    let s, x = ToDBL.query_preterm_of_ast ~depth F.Map.empty s x in
+    let s, t = stack_term_of_preterm ~depth s x in
+    s, (t, x.amap.nargs)
+    ) state t in
+ let env = Array.make nargs Data.dummy in
  let argsdepth = depth in
  state, R.move ~adepth:argsdepth ~from:depth ~to_:depth env t
 ;;
@@ -2013,51 +2055,51 @@ let program_of_ast s p =
 let query_of_ast s p g =
   let s = State.set Data.while_compiling s true in
   let q = query_of_ast s p g in
-  { q with final_state = State.set Data.while_compiling q.final_state false }
+  { q with compiler_state = State.set Data.while_compiling q.compiler_state false }
 
 let query_of_term s p f =
   let s = State.set Data.while_compiling s true in
   let q = query_of_term s p f in
-  { q with final_state = State.set Data.while_compiling q.final_state false }
+  { q with compiler_state = State.set Data.while_compiling q.compiler_state false }
 
 let query_of_data s p l t =
   let s = State.set Data.while_compiling s true in
   let q = query_of_data s p l t in
-  { q with final_state = State.set Data.while_compiling q.final_state false }
+  { q with compiler_state = State.set Data.while_compiling q.compiler_state false }
 
 let executable_of_query (q : 'a WithMain.query) =
-  let q = { q with final_state = State.set Data.while_compiling q.final_state false } in
+  let q = { q with compiler_state = State.set Data.while_compiling q.compiler_state true } in
   let e = executable_of_query q in
   { e with initial_runtime_state = State.set Data.while_compiling e.initial_runtime_state false }
 
 
 let static_check header ~exec ?(checker=default_checker ()) ?(flags=default_flags)
-  ({ WithMain.types; type_abbrevs; initial_depth; final_state } as q)
-=
-  let p,q = quote_syntax q in
-  let tlist = R.list_to_lp_list (List.map
-    (fun { Structured.decl = { tname; ttype } } ->
-      App(colonc,mkQCon ~on_type:false tname,
-        [close_w_binder forallc
-          (quote_preterm ~on_type:true
-            (unfold_type_abbrevs initial_depth type_abbrevs ttype))
-          ttype.amap]))
-    types) in
-  let talist =
-    C.Map.bindings type_abbrevs |> List.map (fun (name, { tavalue;  } ) ->
-        App(colonec, Data.C.of_string (C.show name),
-          [lam2forall (quote_preterm ~on_type:true (unfold_type_abbrevs initial_depth type_abbrevs tavalue))]))
-    |> R.list_to_lp_list
+  ({ WithMain.types; type_abbrevs; initial_depth; compiler_state } as q) =
+  let state = (init_state { (State.get compiler_flags compiler_state) with allow_untyped_builtin = true }) in
+  let state = Data.State.set Data.while_compiling state true in
+  let _,_,builtins = State.get Data.BuiltInPredicate.builtins compiler_state in
+  let state = List.fold_left Data.BuiltInPredicate.register state builtins in
+  let state, p,q = quote_syntax state q in
+  let state, tlist = map_acc
+    (fun state { Structured.decl = { tname; ttype } } ->
+      let state, c = mkQCon ~compiler_state state ~on_type:false tname in
+      let ttypet = unfold_type_abbrevs ~compiler_state initial_depth type_abbrevs ttype in
+      let state, ttypet = quote_preterm ~compiler_state state ~on_type:true ttypet in
+      state, App(colonc,c, [close_w_binder forallc ttypet ttype.amap]))
+      state types in
+  let state, talist =
+    C.Map.bindings type_abbrevs |>
+    map_acc (fun state (name, { tavalue;  } ) ->
+      let tavaluet = unfold_type_abbrevs ~compiler_state initial_depth type_abbrevs tavalue in
+      let state, tavaluet = quote_preterm ~compiler_state state ~on_type:true tavaluet in
+      state, App(colonec, Data.C.of_string (Symbols.show compiler_state name), [lam2forall tavaluet])) state
     in
-  let state = (init_state { (State.get compiler_flags final_state) with allow_untyped_builtin = true }) in
-  let state = State.set Data.Symbols.table state (State.get Data.Symbols.table final_state) in
-  let state = State.set Data.BuiltInPredicate.builtins state (State.get Data.BuiltInPredicate.builtins final_state) in
   let state, checker = program_of_ast state (header @ checker) in
   let loc = Loc.initial "(static_check)" in
   let query =
     query_of_term state checker (fun ~depth state ->
       assert(depth=0);
-      state, (loc,App(checkc,R.list_to_lp_list p,[q;tlist;talist]))) in
+      state, (loc,App(checkc,R.list_to_lp_list p,[q;R.list_to_lp_list tlist;R.list_to_lp_list talist]))) in
   let executable = executable_of_query query in
   exec executable <> Failure
 ;;
